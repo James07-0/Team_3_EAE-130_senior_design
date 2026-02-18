@@ -46,7 +46,7 @@ e_gear = e_clean # Assuming landing gear does not affect the efficiency factor
 landing_fg = C_D_0 + delta_CD0_landing + delta_CD0_gear + coef_landing*cL_landing*cL_landing
 
 plt.figure(figsize=(16,9))
-plt.title('Drag Polars')
+plt.title('Drag Polars for Carrier Based Strike Fighter All Configurations')
 plt.xlabel("$C_D$")
 plt.ylabel("$C_L$")
 plt.plot(clean, cL_clean, label='Clean', linestyle='-', linewidth=2)
