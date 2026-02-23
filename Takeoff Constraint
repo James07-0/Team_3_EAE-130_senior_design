@@ -1,0 +1,246 @@
+import numpy as np
+import matplotlib.pyplot as plt
+
+
+# Aero/catapult inputs
+
+AR = 2.096
+e  = 0.8
+k_induced = 1.0 / (np.pi * AR * e)
+
+rho_SL = 0.002377
+g = 32.174
+
+V_end = 170.0
+s_cat = 325.0
+q_cat = 0.5 * rho_SL * V_end**2
+
+CLmax_TO = 1.4
+CL_run = 0.9 * CLmax_TO
+CD0_TO = 0.0495
+CD_run = CD0_TO + k_induced * CL_run**2
+
+def TW_req_engine_catapult(WS):
+    # Engine thrust required during catapult: T/W = D/W = q*CD/(W/S)
+    return (q_cat * CD_run) / WS
+
+def drag_force(S_ref):
+    return q_cat * S_ref * CD_run
+
+def catapult_force_from_energy(S_ref, W, T_total):
+    
+    m = W / g
+    KE = 0.5 * m * V_end**2
+    D = drag_force(S_ref)
+    F_cat = (KE + D * s_cat) / s_cat - T_total
+    return max(F_cat, 0.0)
+
+
+# Payload/crew
+
+W_pilot    = 200.0
+W_avionics = 2500.0
+aim9x      = 190.0
+mk83       = 1100.0
+W_ord      = 4*mk83 + 2*aim9x
+W_payload  = W_avionics + W_ord
+W_crew     = W_pilot
+
+
+# Wetted areas (given)
+
+areas = {
+    "fuselage_wet": 40.844,
+    "main_wing_wet_1": 662.393,
+    "main_wing_wet_2": 662.535,
+    "vstab_wet_1": 69.619,
+    "vstab_wet_2": 69.619,
+    "canopy_wet": 16.542,
+    "intake_wet_1": 89.270,
+    "intake_wet_2": 92.315,
+    "bwb_wet": 296.263,
+    "box_wet": 31.906,
+}
+
+S_vt = areas["vstab_wet_1"] + areas["vstab_wet_2"]
+S_ht = 0.0
+S_wet_fuselage = (areas["fuselage_wet"] + areas["bwb_wet"] + areas["canopy_wet"] +
+                  areas["intake_wet_1"] + areas["intake_wet_2"] + areas["box_wet"])
+
+
+# Fuel fraction model
+
+L_D_max = 8.0
+R_nmi = 1000.0
+E_hr = 0.333
+c_sfc = 0.95
+V_knots = 850.0 / 1.68781
+
+def fuel_fraction_model():
+    L_D = 0.94 * L_D_max
+    W3_W2 = np.exp((-R_nmi * c_sfc) / (V_knots * L_D))
+    W4_W3 = np.exp((-E_hr * c_sfc) / (L_D))
+    W1_W0 = 0.970
+    W2_W1 = 0.985
+    W5_W4 = 0.995
+    W5_W0 = W5_W4 * W4_W3 * W3_W2 * W2_W1 * W1_W0
+    Wf_W0 = (1 - W5_W0) * 1.06
+    return float(np.clip(Wf_W0, 0.05, 0.60))
+
+
+# Engine weight model
+
+n_eng = 2
+
+def calculate_engine_weight(T_0):
+    W_eng_dry = 0.521 * T_0**0.9
+    W_eng_oil = 0.082 * T_0**0.65
+    W_eng_rev = 0.034 * T_0
+    W_eng_control = 0.26 * T_0**0.5
+    W_eng_start = 9.33 * (W_eng_dry/1000.0) ** 1.078
+    return W_eng_dry + W_eng_oil + W_eng_rev + W_eng_control + W_eng_start
+
+T_ref = 22000.0  # per engine
+W_ref = 4000.0   # per engine
+scale_eng = W_ref / calculate_engine_weight(T_ref)
+
+def calculate_empty_weight(S_wing, S_ht, S_vt, S_wet_fuselage, TOGW, T_0, num_engines):
+    W_wing = S_wing * 10.0
+    W_ht   = S_ht   * 5.5
+    W_vt   = S_vt   * 5.5
+    W_fuselage = S_wet_fuselage * 5.0
+
+    W_landing_gear = 0.033 * TOGW
+    W_all_else     = 0.17  * TOGW
+
+    W_eng_single = scale_eng * calculate_engine_weight(T_0)
+    W_engines = W_eng_single * num_engines * 1.3
+
+    return W_wing + W_ht + W_vt + W_fuselage + W_landing_gear + W_engines + W_all_else
+
+
+# Inner loop 
+
+def solve_weight_inner_loop(
+    S_wing, T_total,
+    TOGW_guess=30000.0,   
+    tol_W=1e-6,
+    max_iter=200
+):
+    W0 = TOGW_guess
+    W0_history = []
+    T_0 = T_total / n_eng
+
+    for it in range(max_iter):
+        Wf_W0 = fuel_fraction_model()
+        W_fuel = Wf_W0 * W0
+
+        W_empty = calculate_empty_weight(
+            S_wing, S_ht, S_vt, S_wet_fuselage,
+            W0, T_0, n_eng
+        )
+
+        W_new = W_empty + W_fuel + W_payload + W_crew
+        W0_history.append(W_new)
+
+        if abs(W_new - W0) / max(abs(W0), 1e-9) < tol_W:
+            return W_new, True, it+1, np.array(W0_history)
+
+        W0 = W_new
+
+    return W0, False, max_iter, np.array(W0_history)
+
+
+# Outer loop (T convergence)
+
+def solve_thrust_outer_loop_for_S(
+    S_wing,
+    T_guess_total=40000.0,
+    TOGW_guess=30000.0,
+    tol_T=1e-6,
+    tol_W=1e-6,
+    max_iter_T=200,
+    relax=0.6
+):
+    T = T_guess_total
+    last_W_hist = None
+    last_W = None
+
+    for k in range(max_iter_T):
+        W, okW, itW, W_hist = solve_weight_inner_loop(
+            S_wing=S_wing,
+            T_total=T,
+            TOGW_guess=TOGW_guess,
+            tol_W=tol_W
+        )
+        last_W = W
+        last_W_hist = W_hist
+
+        WS = W / S_wing
+        TW = TW_req_engine_catapult(WS)
+        T_req = TW * W
+
+        if not np.isfinite(T_req) or T_req <= 0:
+            raise ValueError(f"T_req invalid at S={S_wing}: W={W}, WS={WS}, TW={TW}, T_req={T_req}")
+
+        if abs(T_req - T) / max(abs(T), 1e-9) < tol_T:
+            return T_req, W, k+1, last_W_hist
+
+        T = (1 - relax) * T + relax * T_req
+
+    return T, last_W, max_iter_T, last_W_hist
+
+
+# RUN: S range 500–1000
+
+S_grid = np.linspace(500.0, 1000.0, 40)
+T_curve = np.zeros_like(S_grid)
+W_curve = np.zeros_like(S_grid)
+Fcat_curve = np.zeros_like(S_grid)
+
+S_for_weight_plot = 750.0
+idx_weight = int(np.argmin(np.abs(S_grid - S_for_weight_plot)))
+W_hist_for_plot = None
+
+for i, S in enumerate(S_grid):
+    T_i, W_i, itT, W_hist_i = solve_thrust_outer_loop_for_S(
+        S_wing=S,
+        T_guess_total=40000.0,
+        TOGW_guess=30000.0,
+        relax=0.6
+    )
+    T_curve[i] = T_i
+    W_curve[i] = W_i
+    Fcat_curve[i] = catapult_force_from_energy(S_ref=S, W=W_i, T_total=T_i)
+
+    if i == idx_weight:
+        W_hist_for_plot = W_hist_i
+
+
+# PLOTS
+
+plt.figure(figsize=(14,8))
+plt.plot(S_grid, T_curve, linewidth=2)
+plt.xlabel("Wing Area S (ft²)")
+plt.ylabel("Total Engine Thrust T (lbf)")
+plt.title("Converged T vs S — Takeoff/Catapult")
+plt.grid(True, alpha=0.3)
+plt.show()
+
+plt.figure(figsize=(12,7))
+plt.plot(W_hist_for_plot, marker='o')
+plt.xlabel("Iteration")
+plt.ylabel("Estimated TOGW (lb)")
+plt.title("Convergence of TOGW Estimate")
+plt.grid(True, alpha=0.3)
+plt.show()
+
+plt.figure(figsize=(14,8))
+plt.plot(S_grid, Fcat_curve, linewidth=2)
+plt.xlabel("Wing Area S (ft²)")
+plt.ylabel("Average Catapult Force (lbf)")
+plt.title("Catapult Force vs S")
+plt.grid(True, alpha=0.3)
+plt.show()
+
+
