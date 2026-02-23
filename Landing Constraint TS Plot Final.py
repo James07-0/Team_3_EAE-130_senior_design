@@ -3,11 +3,10 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 # ============================================================
-# 1) SIMPLE WEIGHT ESTIMATION (mission fractions + regression We/W0)
+# 1) Weight estimations
 # ============================================================
 
 def empty_weight_fraction(W0: float) -> float:
-    # regression: We/W0 = A * W0^C  (your original)
     A = 2.34
     C = -0.13
     return A * (W0 ** C)
@@ -23,7 +22,8 @@ def fuel_fraction_loiter(endurance_hrs, sfc, L_D):
 def mission_weight_fractions(cruise_range, cruise_speed, cruise_LD,
                              loiter_time, loiter_LD, sfc):
     """
-    Returns WL/W0 (= W6/W0) and Wf/W0 using your mission segment setup.
+    Returns W_end/W0 and Wf/W0 using your mission segment setup.
+    Note: This is mission-fuel sizing, not the RFP landing-weight rule.
     """
     W1_W0 = 0.97
     W2_W1 = 0.985
@@ -32,15 +32,15 @@ def mission_weight_fractions(cruise_range, cruise_speed, cruise_LD,
     W3_W2 = fuel_fraction_cruise(cruise_range, cruise_speed, sfc, cruise_LD)
     W4_W3 = fuel_fraction_loiter(loiter_time, sfc, loiter_LD)
 
-    W6_W0 = W1_W0 * W2_W1 * W3_W2 * W4_W3 * W5_W4
-    Wf_W0 = 1.06 * (1 - W6_W0)
-    return W6_W0, Wf_W0
+    W_end_W0 = W1_W0 * W2_W1 * W3_W2 * W4_W3 * W5_W4
+    Wf_W0 = 1.06 * (1 - W_end_W0)
+    return W_end_W0, Wf_W0
 
-def estimate_weight(W_crew, W_payload,
+def estimate_weight(W_crew, W_payload_fixed,
                     cruise_range, cruise_speed, cruise_LD,
                     loiter_time, loiter_LD, sfc,
                     W0_guess=50000.0):
-    WL_W0, Wf_W0 = mission_weight_fractions(
+    _, Wf_W0 = mission_weight_fractions(
         cruise_range, cruise_speed, cruise_LD,
         loiter_time, loiter_LD, sfc
     )
@@ -49,16 +49,44 @@ def estimate_weight(W_crew, W_payload,
     for _ in range(100):
         We = empty_weight_fraction(W0) * W0
         Wf = Wf_W0 * W0
-        W0_new = We + Wf + W_payload + W_crew
+        W0_new = We + Wf + W_payload_fixed + W_crew
         if abs(W0_new - W0) / max(W0, 1.0) < 1e-6:
             W0 = W0_new
             break
         W0 = W0_new
 
-    return W0, WL_W0
+    return W0
+
 # ============================================================
-# 2) RUNWAY LANDING FIELD LENGTH CONSTRAINT (5150 foot zone)
+# Landing weight fractions
 # ============================================================
+
+def landing_weight_fraction_rfp(
+    W0: float,
+    W_stores_max: float,
+    fuel_max_frac: float,
+    loiter_time_min: float,
+    loiter_LD: float,
+    sfc_loiter: float,
+    n_attempts: int = 2,
+    attempt_time_min_each: float = 5.0,
+    stores_frac_at_landing: float = 0.50
+) -> float:
+    E_total_hr = (loiter_time_min + n_attempts * attempt_time_min_each) / 60.0
+    fuel_remain_frac = np.exp(-E_total_hr * sfc_loiter / max(loiter_LD, 1e-9))
+
+    fuel_max_frac = float(fuel_max_frac)
+
+    stores_drop_frac = 1.0 - stores_frac_at_landing
+    stores_drop_over_W0 = stores_drop_frac * W_stores_max / max(W0, 1e-9)
+
+    WL_W0 = 1.0 - fuel_max_frac * (1.0 - fuel_remain_frac) - stores_drop_over_W0
+    return float(WL_W0)
+
+# ============================================================
+# 2) Carrier landing field length constraint
+# ============================================================
+
 def landing_WS_allowed(S, s_land, rho, g, CD, v_TD, F_avg):
     numerator = s_land * rho * g * CD
     inside = 1.0 + 0.5 * rho * S * CD * v_TD**2 / max(F_avg, 1.0)
@@ -77,25 +105,26 @@ def landing_W0S_allowed_carrier(
 ):
     WL_over_S_max = landing_WS_allowed(S, s_land_ft, rho, g, CD, v_TD, F_avg)
     W0_over_S_max = WL_over_S_max / max(WL_W0, 1e-9)
-    return W0_over_S_max, v_TD, None
+    return W0_over_S_max
 
 # ============================================================
-# 3) MISSION CONFIG
+# 3) Mission configuration
 # ============================================================
+
 class MissionConfig:
     def __init__(self, engine="twin"):
         aim9x = 190
         mk83_jdam = 1100
-        strike_ordnance = 4 * mk83_jdam + 2 * aim9x
+        self.W_stores_max = 4 * mk83_jdam + 2 * aim9x   # <-- stores only
 
         self.W_crew = 200
         self.W_avionics = 2500
-        self.W_payload = self.W_avionics + strike_ordnance
 
         self.cruise_range = 1000
         self.cruise_speed = 850
         self.cruise_LD = 8
 
+        # keep for mission sizing (not the RFP landing fuel rule)
         self.loiter_time = 0.333
         self.loiter_LD = 8
 
@@ -107,27 +136,42 @@ class MissionConfig:
             self.W0_guess = 60000
 
 # ============================================================
-# 4) DRIVER / PLOT
+# 4) Driver and plotting
 # ============================================================
+
 def main():
     mission = MissionConfig(engine="twin")
 
     # ---- Carrier landing parameters ----
-    s_land = 300          # ft (use your carrier-deck stopping distance if you want; 5150 is long for a carrier)
-    rho = 0.002377          # slug/ft^3
-    g = 32.174             # ft/s^2
+    s_land = 300          # ft
+    rho = 0.002377        # slug/ft^3
+    g = 32.174            # ft/s^2
 
-    CD = 0.5855               # <-- landing configuration drag coefficient (you choose)
-    v_TD = 188.0           # <-- touchdown speed (ft/s) you choose
-    F_avg = 127000.0        # <-- average hook force (lbf) you choose
+    CD = 0.5855
+    v_TD = 216.2          # ft/s
+    F_avg = 127000.0      # lbf
 
     # Design thrust loading (for mapping into T–S)
     T_over_W_design = 1.169
 
-    # Mission W0 and WL/W0
-    W0, WL_W0 = estimate_weight(
+    # ---- RFP landing-weight requirement inputs ----
+    fuel_max_frac = 0.25          # 25% max fuel weight
+    loiter_time_min = 20.0        # 20 minutes loiter at 10,000 ft
+    n_attempts = 2                # two landing attempts
+    attempt_time_min_each = 5.0   # <-- set per your RFP/assumption (pattern time)
+    stores_frac_at_landing = 0.50 # 50% store weight
+
+    # For lack of separate loiter SFC at 10k ft, reuse mission.sfc (or set another value)
+    sfc_loiter = mission.sfc
+    loiter_LD_landing = mission.loiter_LD
+
+    # ---- Size W0 (mission sizing) ----
+    # For W0 sizing payload, include avionics + max stores (common for conservative sizing).
+    W_payload_fixed_for_sizing = mission.W_avionics + mission.W_stores_max
+
+    W0 = estimate_weight(
         mission.W_crew,
-        mission.W_payload,
+        W_payload_fixed_for_sizing,
         mission.cruise_range,
         mission.cruise_speed,
         mission.cruise_LD,
@@ -136,7 +180,22 @@ def main():
         mission.sfc,
         mission.W0_guess
     )
-    print(f"W0 = {W0:.1f} lbf,  WL/W0 = {WL_W0:.4f}")
+
+    WL_W0_rfp = landing_weight_fraction_rfp(
+        W0=W0,
+        W_stores_max=mission.W_stores_max,
+        fuel_max_frac=fuel_max_frac,
+        loiter_time_min=loiter_time_min,
+        loiter_LD=loiter_LD_landing,
+        sfc_loiter=sfc_loiter,
+        n_attempts=n_attempts,
+        attempt_time_min_each=attempt_time_min_each,
+        stores_frac_at_landing=stores_frac_at_landing
+    )
+
+    print(f"W0 = {W0:.1f} lbf")
+    print(f"RFP landing fraction WL/W0 = {WL_W0_rfp:.4f}")
+    print(f"RFP landing weight WL = {WL_W0_rfp*W0:.1f} lbf")
 
     # Wing area grid
     S_grid = np.linspace(600, 1400, 40)
@@ -144,7 +203,7 @@ def main():
     # Carrier landing constraint gives a W0/S that varies with S
     W0S_curve = np.zeros_like(S_grid, dtype=float)
     for i, S in enumerate(S_grid):
-        W0S_curve[i], _, _ = landing_W0S_allowed_carrier(
+        W0S_curve[i] = landing_W0S_allowed_carrier(
             S=S,
             s_land_ft=s_land,
             rho=rho,
@@ -152,16 +211,18 @@ def main():
             CD=CD,
             v_TD=v_TD,
             F_avg=F_avg,
-            WL_W0=WL_W0
+            WL_W0=WL_W0_rfp
         )
+
     # Map to thrust vs wing area
     T_from_landing = T_over_W_design * W0S_curve * S_grid
+
     # Plot
     plt.figure()
-    plt.plot(S_grid, T_from_landing, marker='o')
+    plt.plot(S_grid, T_from_landing, marker='o', label="Carrier landing (RFP WL)")
     plt.xlabel("Wing Area S (ft²)")
     plt.ylabel("Thrust T (lbf)")
-    plt.title("T–S plot: Carrier arresting-gear landing constraint")
+    plt.title("T–S plot: Carrier arresting-gear landing constraint (RFP landing weight)")
     plt.xlim(S_grid.min(), S_grid.max())
     plt.ylim(0, 1.05*np.max(T_from_landing))
     plt.grid(True)
